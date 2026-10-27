@@ -41,6 +41,7 @@ from powercontext.limits import (
     MAX_EXTERNAL_SKILL_HOST_ID_LENGTH,
     MAX_EXTERNAL_SKILL_LOCATOR_LENGTH,
     MAX_EXTERNAL_SKILL_NAME_LENGTH,
+    MAX_LIFECYCLE_NODE_ID_LENGTH,
     MAX_SCOPE_BINDING_EXTERNAL_ID_LENGTH,
     MAX_SCOPE_BINDING_INTEGRATION_LENGTH,
     MAX_SCOPE_BINDING_KIND_LENGTH,
@@ -1180,6 +1181,18 @@ RECURRENCE_OBSERVATION_TABLE = Table(
 
 RECURRENCE_TABLES = (RECURRENCE_MATCH_TABLE, RECURRENCE_OBSERVATION_TABLE)
 
+SOURCE_LIFECYCLE_NODES_TABLE = Table(
+    "pc_source_lifecycle_nodes",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_LIFECYCLE_NODE_ID_LENGTH), primary_key=True),
+    # One canonical record: kind, policy, parents, original reference, lifecycle
+    # revision/sequence, propagated availability and native-application state.
+    Column("payload", _canonical_payload_type(), nullable=False),
+    Column("ordinal", BigInteger, nullable=False),
+    CheckConstraint("ordinal >= 1", name="ck_pc_source_lifecycle_nodes_ordinal_positive"),
+)
+
 BUILTIN_TABLES = (
     SCOPE_TABLES
     + SHARED_TABLES
@@ -1187,5 +1200,5 @@ BUILTIN_TABLES = (
     + MEMORY_TABLES
     + STATISTICS_TABLES
     + RECURRENCE_TABLES
-    + (ARTIFACT_TAGS_TABLE, DREAM_RUNS_TABLE, RECEIPT_MIGRATION_REVIEW_TABLE)
+    + (ARTIFACT_TAGS_TABLE, DREAM_RUNS_TABLE, RECEIPT_MIGRATION_REVIEW_TABLE, SOURCE_LIFECYCLE_NODES_TABLE)
 )

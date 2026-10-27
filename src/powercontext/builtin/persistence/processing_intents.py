@@ -199,6 +199,65 @@ class ArtifactProcessingIntentRepository:
         rows = (await connection.execute(statement.order_by(table.c.pending_sequence).limit(limit))).mappings()
         return tuple(StoredArtifactProcessingIntent.model_validate(dict(row)) for row in rows)
 
+    async def idle(
+        self,
+        connection: AsyncConnection,
+        binding_name: str,
+        /,
+        *,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> tuple[StoredArtifactProcessingIntent, ...]:
+        """Return registered Scopes with no accepted-but-unhandled invocation."""
+
+        _require_identifier("binding_name", binding_name, MAX_BINDING_NAME_LENGTH)
+        _require_nonnegative("after_sequence", after_sequence)
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise InvalidRepositoryArgumentError("limit", "must be a positive integer")
+        table = ARTIFACT_PROCESSING_INTENTS_TABLE
+        statement = (
+            select(table)
+            .where(
+                table.c.binding_name == binding_name,
+                table.c.pending_sequence > after_sequence,
+                table.c.requested_generation == table.c.handled_generation,
+            )
+            .order_by(table.c.pending_sequence)
+            .limit(limit)
+        )
+        rows = (await connection.execute(statement)).mappings()
+        return tuple(StoredArtifactProcessingIntent.model_validate(dict(row)) for row in rows)
+
+    async def accept_idle(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        binding_name: str,
+        /,
+    ) -> StoredArtifactProcessingIntent:
+        """Accept one Scope for an already-qualified activation condition.
+
+        Unlike an automatic scan member this needs no frozen scan: the caller
+        re-derives the condition from durable journal and cursor state on every
+        pass. Accepting is idempotent while a previous invocation is still
+        outstanding, so a slow Worker is never queued twice.
+        """
+
+        current = await self.load(connection, scope_id, binding_name, for_update=True)
+        if current is None:
+            raise InvalidRepositoryArgumentError("scope_id", "count member is not registered")
+        if current.requested_generation > current.handled_generation:
+            return current
+        table = ARTIFACT_PROCESSING_INTENTS_TABLE
+        await connection.execute(
+            update(table)
+            .where(table.c.scope_id == scope_id, table.c.binding_name == binding_name)
+            .values(requested_generation=current.requested_generation + 1)
+        )
+        return cast(
+            StoredArtifactProcessingIntent, await self.load(connection, scope_id, binding_name, for_update=True)
+        )
+
     async def max_sequence(self, connection: AsyncConnection, binding_name: str, /) -> int:
         _require_identifier("binding_name", binding_name, MAX_BINDING_NAME_LENGTH)
         table = ARTIFACT_PROCESSING_INTENTS_TABLE

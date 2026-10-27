@@ -81,7 +81,7 @@ def tag_predicate(
     return count == len(tag_filter.keys) if tag_filter.match == "all" else count > 0
 
 
-def memory_tag_sql(alias: Literal["f", "m"]) -> str:
+def memory_tag_sql(alias: Literal["f", "h", "m"]) -> str:
     """A parameterized predicate for native FTS/vector SQL (aliases are internal)."""
 
     return """

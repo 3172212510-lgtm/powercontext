@@ -166,6 +166,7 @@ from powercontext.builtin.runtime._scope_cache import (
     ScopeCacheObserver,
     ScopeEvictor,
 )
+from powercontext.builtin.runtime.context_pack import ContextPack, ContextPackDelta
 from powercontext.builtin.runtime.decision_model import DecisionModel
 from powercontext.builtin.runtime.errors import InvalidRuntimeRequestError, TopicMemoryProcessingUnavailableError
 from powercontext.builtin.runtime.models import (
@@ -846,6 +847,24 @@ class ScopedContextApplication:
             if authorize_scopes is not None:
                 await authorize_scopes((self.scope_id, *scope.context_references))
             return await self._prepare(request, scope)
+
+    async def prepare_incremental(
+        self,
+        request: PrepareContextRequest,
+        /,
+        base_pack: ContextPack | None = None,
+    ) -> ContextPack | ContextPackDelta:
+        """Return a full Context Pack, or a delta against ``base_pack`` when given.
+
+        The target content is always produced by the ordinary ``prepare`` path, so
+        plain and incremental transports stay byte-identical for the same request.
+        """
+
+        prepared = await self.prepare(request)
+        target = ContextPack.from_content(prepared.content or "")
+        if base_pack is None:
+            return target
+        return ContextPackDelta.between(base_pack, target)
 
     async def _prepare(self, request: PrepareContextRequest, scope: ScopeDescriptor, /) -> PreparedContext:
         build, effort = await self._prepare_build(request, scope)
@@ -2641,6 +2660,16 @@ class ScopedTopicMemoryApplication:
             raise InvalidRuntimeRequestError("topic-memory-query-terms")
 
         used_fallback = False
+        excluded = await self._inactive_topic_refs()
+        # Over-fetch by the number of withdrawn topics so a withdrawal does not
+        # shrink the result page for the still-supported neighbours.
+        effective = (
+            request
+            if not excluded
+            else request.model_copy(
+                update={"limit": min(request.limit + len(excluded), MAX_TOPIC_MEMORY_SEARCH_LIMIT)}
+            )
+        )
         async with self._runtime._scoped_operation(
             self.scope_id,
             embedding_purpose=ModelUsagePurpose.TOPIC_MEMORY_RECALL,
@@ -2653,20 +2682,30 @@ class ScopedTopicMemoryApplication:
                 result = await search(
                     self.scope_id,
                     query,
-                    limit=request.limit,
+                    limit=effective.limit,
                     mode="fts",
                     **_admission_keyword(admission),
                 )
                 result = result.model_copy(update={"embedding_calls": 0})
             else:
                 result, used_fallback = await self._search_with_embedding(
-                    request,
+                    effective,
                     embedding,
                     search,
                     admission,
                     query_embedding,
                     embedding_timeout_seconds,
                 )
+        if excluded:
+            result = result.model_copy(
+                update={
+                    "hits": tuple(
+                        hit
+                        for hit in result.hits
+                        if (hit.artifact_ref.artifact_id, hit.artifact_ref.revision) not in excluded
+                    )[: request.limit]
+                }
+            )
         observer = self._runtime._topic_memory_search_observer
         if observer is not None:
             try:
@@ -2684,6 +2723,14 @@ class ScopedTopicMemoryApplication:
                     },
                 )
         return result
+
+    async def _inactive_topic_refs(self) -> frozenset[tuple[str, int]]:
+        """Return Topic revisions withdrawn by Source lifecycle propagation."""
+
+        lifecycle = self._runtime.lifecycle
+        if lifecycle is None:
+            return frozenset()
+        return await lifecycle.for_scope(self.scope_id).inactive_topic_refs()
 
     async def _search_with_embedding(
         self,
@@ -3117,6 +3164,7 @@ class BuiltinRuntime:
         self.remote_skills = RemoteSkillApplication(self)
         self.statistics = StatisticsApplication(self)
         self.handoff_report: HandoffReportApplication | None = None
+        self.lifecycle: Any = None
         self.artifact_processing_supervisor: ArtifactProcessingSupervisors | None = None
         self.processor = None if scope_ids is None else ScheduledSourceProcessor(self, scope_ids)
         self.experience_processor = (

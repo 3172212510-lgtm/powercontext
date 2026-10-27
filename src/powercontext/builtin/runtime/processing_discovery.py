@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -24,6 +26,89 @@ from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.processing_intents import ArtifactProcessingIntentRepository
 from powercontext.builtin.persistence.supervision import ArtifactProcessingFence, ArtifactProcessingLeaseRepository
 from powercontext.builtin.persistence.tables import PROFILE_POLICIES_TABLE, SOURCE_JOURNAL_HEADS_TABLE
+
+_COUNT_PAGE_SIZE = 100
+_MAX_COUNT_PAGES = 8
+
+
+async def journal_heads(connection: AsyncConnection, scope_ids: Sequence[str]) -> dict[str, int]:
+    """Return the committed journal length for one Scope selection."""
+
+    scopes = tuple(dict.fromkeys(scope_ids))
+    if not scopes:
+        return {}
+    rows = await connection.execute(
+        select(SOURCE_JOURNAL_HEADS_TABLE.c.scope_id, SOURCE_JOURNAL_HEADS_TABLE.c.position).where(
+            SOURCE_JOURNAL_HEADS_TABLE.c.scope_id.in_(scopes)
+        )
+    )
+    return {str(scope): int(position) for scope, position in rows}
+
+
+class SourceCountAdmission:
+    """Accept Scopes whose unconsumed journal identities reached a threshold.
+
+    Counting uses durable journal identity only: the number of entries after the
+    Family's own last successful cursor. Duplicate captures and receipt trust
+    upgrades reuse an existing identity and never raise the count, while a
+    lineage-only entry occupies one position and does raise it.
+    """
+
+    def __init__(
+        self,
+        binding_name: str,
+        threshold: int,
+        *,
+        intents: ArtifactProcessingIntentRepository | None = None,
+        cursors: SourceCursorRepository | None = None,
+    ) -> None:
+        if type(threshold) is not int or threshold < 1:
+            raise ValueError("Source count threshold must be a positive integer")  # noqa: TRY003
+        self.binding_name = binding_name
+        self.threshold = threshold
+        self._intents = ArtifactProcessingIntentRepository() if intents is None else intents
+        self._cursors = SourceCursorRepository() if cursors is None else cursors
+
+    async def ready(self, connection: AsyncConnection, limit: int) -> tuple[str, ...]:
+        """Return count-ready Scopes in stable registration order.
+
+        The caller holds a fence and a transaction; this reads journal metadata
+        only, never a Source body, prompt, or model.
+        """
+
+        selected: list[str] = []
+        after = 0
+        for _ in range(_MAX_COUNT_PAGES):
+            if len(selected) >= limit:
+                break
+            rows = await self._intents.idle(
+                connection, self.binding_name, after_sequence=after, limit=_COUNT_PAGE_SIZE
+            )
+            if not rows:
+                break
+            after = rows[-1].pending_sequence
+            scopes = tuple(row.scope_id for row in rows)
+            heads = await journal_heads(connection, scopes)
+            cursors = await self._cursors.load_many(connection, scopes, self.binding_name)
+            for scope in scopes:
+                cursor = cursors.get(scope)
+                consumed = 0 if cursor is None else cursor.cursor.sequence
+                if heads.get(scope, 0) - consumed >= self.threshold:
+                    selected.append(scope)
+                    if len(selected) >= limit:
+                        break
+            if len(rows) < _COUNT_PAGE_SIZE:
+                break
+        return tuple(selected)
+
+    async def accept(self, connection: AsyncConnection, limit: int) -> tuple[str, ...]:
+        """Accept every currently ready Scope without waiting for the time window."""
+
+        admitted: list[str] = []
+        for scope in await self.ready(connection, limit):
+            await self._intents.accept_idle(connection, scope, self.binding_name)
+            admitted.append(scope)
+        return tuple(admitted)
 
 
 async def enabled_profile_scopes(connection: AsyncConnection, scope_ids: tuple[str, ...]) -> frozenset[str]:

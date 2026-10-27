@@ -67,6 +67,7 @@ from powercontext.builtin.runtime.processing_contracts import (
     ArtifactProcessingWorkerOutcome,
     WorkerEntrypoint,
 )
+from powercontext.builtin.runtime.processing_discovery import SourceCountAdmission
 from powercontext.builtin.runtime.protocols import RuntimeTracing
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,7 @@ _DISCOVERY_PAGE_SIZE = 100
 _RETRY_STATE_LIMIT = 1000
 _CHANNEL_QUEUE_LIMIT = _DISCOVERY_PAGE_SIZE // 2
 _DISCOVERY_PAGE_DELAY_SECONDS = 0.01
+_COUNT_TRIGGER_POLL_SECONDS = 0.2
 _DISCOVERY_TIMEOUT_SECONDS = 2.0
 _SPAWN_SIGTERM_GRACE_SECONDS = 1.0
 _WORKER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -110,6 +112,9 @@ class ArtifactProcessingBinding:
     max_workers: int = 1
     worker_timeout_seconds: float = 600.0
     automatic_processing_interval: timedelta | None = None
+    # Independent activation condition: accept a Scope once this many journal
+    # identities are unconsumed past its own successful cursor.
+    source_count_threshold: int | None = None
     cron: str | None = None
     timezone: str = "Asia/Shanghai"
     config_prefix: str | None = None
@@ -138,6 +143,10 @@ class ArtifactProcessingBinding:
                 raise ValueError("interval and cron cannot both be enabled")  # noqa: TRY003
         if self.cron is not None:
             CronTrigger.from_crontab(self.cron, timezone=ZoneInfo(self.timezone))
+        if self.source_count_threshold is not None and (
+            type(self.source_count_threshold) is not int or self.source_count_threshold < 1
+        ):
+            raise ValueError("source_count_threshold must be a positive integer")  # noqa: TRY003
 
 
 class _WorkerResultSender(Protocol):
@@ -386,6 +395,7 @@ class _RunningWorker:
 @dataclass(slots=True)
 class _FamilyState:
     binding: ArtifactProcessingBinding
+    count_admission: SourceCountAdmission | None = None
     ready: deque[str] = field(default_factory=deque)
     queued: set[str] = field(default_factory=set)
     retry_queued: set[str] = field(default_factory=set)
@@ -442,7 +452,15 @@ class ArtifactProcessingSupervisor:
         ):
             raise ValueError("dedicated Supervisor must own exactly its named Family")  # noqa: TRY003
         self._database = database
-        self._families = {binding.binding_name: _FamilyState(binding) for binding in bindings}
+        self._families = {
+            binding.binding_name: _FamilyState(
+                binding,
+                None
+                if binding.source_count_threshold is None
+                else SourceCountAdmission(binding.binding_name, binding.source_count_threshold),
+            )
+            for binding in bindings
+        }
         self._lease_mode = lease_mode
         self._supervisor_group = supervisor_group
         self._intents = intents or ArtifactProcessingIntentRepository()
@@ -652,9 +670,11 @@ class ArtifactProcessingSupervisor:
         state.automatic_next = not state.automatic_next
         if state.automatic_next:
             await self._discover_automatic(state)
+            await self._discover_count(state)
             await self._discover_requested(state)
         else:
             await self._discover_requested(state)
+            await self._discover_count(state)
             await self._discover_automatic(state)
 
     async def _discover_requested(self, state: _FamilyState) -> None:
@@ -697,6 +717,27 @@ class ArtifactProcessingSupervisor:
         else:
             state.discovery_pending = True
             state.next_discovery_at = asyncio.get_running_loop().time() + _DISCOVERY_PAGE_DELAY_SECONDS
+
+    async def _discover_count(self, state: _FamilyState) -> None:
+        """Accept Scopes that reached their configured pending-identity count.
+
+        This is an OR with the time condition: a Scope whose unconsumed journal
+        entries reached the threshold starts processing without an explicit
+        flush or a due schedule. The count is re-derived from durable journal and
+        cursor state, so an already-accepted invocation is never queued twice and
+        work that outlived a restart is rediscovered without new input.
+        """
+
+        admission = state.count_admission
+        capacity = self._fresh_capacity(state)
+        if admission is None or capacity <= 0:
+            return
+        async with self._database.transaction() as connection:
+            await self._leases.require_fence(connection, self._require_current_fence())
+            admitted = await admission.accept(connection, min(capacity, _DISCOVERY_PAGE_SIZE))
+        for scope in admitted:
+            if scope not in state.running and scope not in state.retries:
+                self._enqueue(state, scope)
 
     async def _discover_automatic(self, state: _FamilyState) -> None:  # noqa: C901 - bounded admission state
         binding = state.binding
@@ -1093,6 +1134,10 @@ class ArtifactProcessingSupervisor:
                 continue
             if state.next_schedule_at is not None:
                 deadlines.append(state.next_schedule_at)
+            if state.count_admission is not None:
+                # A count threshold has no scheduled instant, so poll its durable
+                # counters while a Worker slot is free.
+                deadlines.append(now + _COUNT_TRIGGER_POLL_SECONDS)
             if state.discovery_pending or state.scan_in_progress or not state.reconcile_complete or state.degraded:
                 deadlines.append(max(now, state.next_discovery_at))
         return None if not deadlines else max(0.001, min(deadlines) - now)

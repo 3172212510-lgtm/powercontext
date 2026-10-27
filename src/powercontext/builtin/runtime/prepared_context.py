@@ -93,6 +93,16 @@ class PreparedContextOmissions:
 
 
 @dataclass(frozen=True)
+class ContextFragment:
+    """One literal character span of a Memory entry selected as evidence."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
+
+
+@dataclass(frozen=True)
 class PreparedContextBuild:
     """Final public context and the exact origins selected to produce it.
 
@@ -106,6 +116,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[ContextFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -235,6 +246,13 @@ class PreparedContextBuilder:
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
             raise PreparedContextInvariantError("experience-candidate-limit")
 
+        if request.evidence_selection:
+            return self._select_fragment_build(
+                request=request,
+                current_scope_id=current_scope_id,
+                memory_candidates=memory_candidates,
+            )
+
         content, origins, omissions = self._select_entries(
             request=request,
             current_scope_id=current_scope_id,
@@ -292,6 +310,100 @@ class PreparedContextBuilder:
             truncated_items=omissions.truncated_items,
             dropped_items=omissions.dropped_items,
             unused_bytes=max(0, request.max_bytes - content_bytes),
+        )
+
+    def _select_fragment_build(
+        self,
+        *,
+        request: PrepareContextRequest,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Select query-relevant literal spans of Memory text within the byte budget.
+
+        Every delivered span is a character interval of the original entry, so a caller can
+        re-read the exact text through the entry citation. Spans of one entry that touch are
+        merged, which spends the repeated citation envelope once instead of per sentence.
+        """
+
+        from powercontext.builtin.artifacts.search import analyze_text
+
+        query_terms = frozenset(analyze_text(request.query).split())
+        entries: list[tuple[MemoryEntryAddress, str, set[str]]] = []
+        for group in memory_candidates:
+            scope_id = group.scope_id or current_scope_id or ""
+            if group.hits and group.memory_ref is None:
+                raise PreparedContextInvariantError("memory-ref-missing")
+            seen: set[tuple[str, str]] = set()
+            for hit in group.hits:
+                if hit.memory_ref != group.memory_ref:
+                    raise PreparedContextInvariantError("memory-ref-mismatch")
+                identity = (hit.entry_id, hit.entry_version_id)
+                if identity in seen or not hit.text.strip():
+                    continue
+                seen.add(identity)
+                entries.append(
+                    (
+                        MemoryEntryAddress(
+                            memory=ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref),
+                            entry_id=hit.entry_id,
+                            entry_version_id=hit.entry_version_id,
+                        ),
+                        hit.text,
+                        set(analyze_text(hit.text).split()),
+                    )
+                )
+        if not entries:
+            return PreparedContextBuild(context=self.empty(), origins=())
+
+        # Weight query terms by how rare they are among the retrieved candidates, so a common
+        # token cannot outvote the term that actually identifies the evidence sentence.
+        weights = _term_weights(query_terms, tuple(tokens for _, _, tokens in entries))
+        candidates: list[tuple[float, int, MemoryEntryAddress, str, int, int]] = []
+        order = 0
+        for address, text, _tokens in entries:
+            for start, end in _segments(text):
+                score = _segment_score(text[start:end], weights)
+                if score <= 0:
+                    continue
+                candidates.append((score, order, address, text, start, end))
+                order += 1
+        if not candidates:
+            return PreparedContextBuild(context=self.empty(), origins=())
+
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        # Only spend budget on spans that are competitive with the best one; a long tail of
+        # weak single-term matches would otherwise crowd out the real evidence.
+        floor = candidates[0][0] * _FRAGMENT_SCORE_FLOOR
+        candidates = [candidate for candidate in candidates if candidate[0] >= floor]
+        addresses: dict[tuple[str, str, str, int, str, str], MemoryEntryAddress] = {}
+        texts: dict[tuple[str, str, str, int, str, str], str] = {}
+        spans: dict[tuple[str, str, str, int, str, str], tuple[tuple[int, int], ...]] = {}
+        insertion: list[tuple[str, str, str, int, str, str]] = []
+        for _score, _order, address, text, start, end in candidates[:_MAX_FRAGMENT_CANDIDATES]:
+            key = _fragment_key(address)
+            addresses.setdefault(key, address)
+            texts.setdefault(key, text)
+            if key not in insertion:
+                insertion.append(key)
+            trial = dict(spans)
+            trial[key] = _merge_span(spans.get(key, ()), start, end)
+            fragments = _fragments_from(insertion, trial, addresses, texts)
+            if len(_render_fragments(fragments).encode("utf-8")) > request.max_bytes:
+                continue
+            spans = trial
+
+        fragments = _fragments_from(insertion, spans, addresses, texts)
+        if not fragments:
+            return PreparedContextBuild(context=self.empty(), origins=())
+        content = _render_fragments(fragments)
+        content_bytes = len(content.encode("utf-8"))
+        if content_bytes > request.max_bytes:
+            raise PreparedContextInvariantError("output-budget")
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
+            origins=tuple(fragment.address for fragment in fragments),
+            fragments=fragments,
         )
 
     def _select_entries(
@@ -728,3 +840,136 @@ def _truncate_utf8(text: str, byte_budget: int) -> str:
     prefix_budget = byte_budget - len(_ELLIPSIS.encode("utf-8"))
     encoded_prefix = text.encode("utf-8")[:prefix_budget]
     return f"{encoded_prefix.decode('utf-8', errors='ignore')}{_ELLIPSIS}"
+
+
+_FragmentKey = tuple[str, str, str, int, str, str]
+_MAX_FRAGMENT_CANDIDATES = 400
+_MAX_SEGMENT_CHARS = 320
+_FRAGMENT_SCORE_FLOOR = 0.35
+_SENTENCE_TERMINATORS = frozenset(".!?。！？")
+
+
+def _fragment_key(address: MemoryEntryAddress) -> _FragmentKey:
+    return (
+        address.memory.scope_id,
+        address.memory.artifact.family,
+        address.memory.artifact.artifact_id,
+        address.memory.artifact.revision,
+        address.entry_id,
+        address.entry_version_id,
+    )
+
+
+def _segments(text: str) -> tuple[tuple[int, int], ...]:
+    """Split text into sentence-sized spans that keep their original offsets."""
+
+    spans: list[tuple[int, int]] = []
+    start = 0
+    index = 0
+    length = len(text)
+    while index < length:
+        character = text[index]
+        if character == "\n":
+            spans.append((start, index))
+            start = index + 1
+        elif character in _SENTENCE_TERMINATORS:
+            cursor = index + 1
+            while cursor < length and text[cursor] in _SENTENCE_TERMINATORS:
+                cursor += 1
+            spans.append((start, cursor))
+            start = cursor
+            index = cursor - 1
+        index += 1
+    if start < length:
+        spans.append((start, length))
+
+    capped: list[tuple[int, int]] = []
+    for span_start, span_end in spans:
+        while span_end - span_start > _MAX_SEGMENT_CHARS:
+            cut = text.rfind(" ", span_start, span_start + _MAX_SEGMENT_CHARS)
+            if cut <= span_start:
+                cut = span_start + _MAX_SEGMENT_CHARS
+            capped.append((span_start, cut))
+            span_start = cut
+        capped.append((span_start, span_end))
+    return tuple((start, end) for start, end in capped if text[start:end].strip())
+
+
+def _term_weights(query_terms: frozenset[str], documents: Sequence[set[str]]) -> dict[str, float]:
+    """Return inverse-document-frequency weights for the query terms seen in the candidates."""
+
+    import math
+
+    total = len(documents)
+    weights: dict[str, float] = {}
+    for term in query_terms:
+        frequency = sum(1 for tokens in documents if term in tokens)
+        weights[term] = math.log(1.0 + total / (1.0 + frequency))
+    return weights
+
+
+def _segment_score(body: str, weights: dict[str, float]) -> float:
+    if not weights:
+        return 0.0
+    from powercontext.builtin.artifacts.search import analyze_text
+
+    tokens = set(analyze_text(body).split())
+    score = 0.0
+    for term in tokens:
+        weight = weights.get(term)
+        if weight is not None:
+            score += weight
+    return score
+
+
+def _merge_span(
+    spans: tuple[tuple[int, int], ...],
+    start: int,
+    end: int,
+) -> tuple[tuple[int, int], ...]:
+    merged = sorted((*spans, (start, end)))
+    result: list[tuple[int, int]] = []
+    for span_start, span_end in merged:
+        if result and span_start <= result[-1][1] + 1:
+            result[-1] = (result[-1][0], max(result[-1][1], span_end))
+        else:
+            result.append((span_start, span_end))
+    return tuple(result)
+
+
+def _fragments_from(
+    insertion: Sequence[_FragmentKey],
+    spans: dict[_FragmentKey, tuple[tuple[int, int], ...]],
+    addresses: dict[_FragmentKey, MemoryEntryAddress],
+    texts: dict[_FragmentKey, str],
+) -> tuple[ContextFragment, ...]:
+    fragments: list[ContextFragment] = []
+    for key in insertion:
+        text = texts[key]
+        for start, end in spans.get(key, ()):
+            fragments.append(
+                ContextFragment(address=addresses[key], start=start, end=end, text=text[start:end])
+            )
+    return tuple(fragments)
+
+
+def _render_fragments(fragments: Sequence[ContextFragment]) -> str:
+    envelope = {
+        "trust": "untrusted_history",
+        "items": [
+            {
+                "citation": {
+                    "scope_id": fragment.address.memory.scope_id,
+                    "memory_ref": fragment.address.memory.artifact.model_dump(mode="json"),
+                    "entry_id": fragment.address.entry_id,
+                    "entry_version_id": fragment.address.entry_version_id,
+                },
+                "content": fragment.text,
+                "start": fragment.start,
+                "end": fragment.end,
+            }
+            for fragment in fragments
+        ],
+    }
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
